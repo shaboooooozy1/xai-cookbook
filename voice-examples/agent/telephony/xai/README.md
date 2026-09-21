@@ -61,6 +61,12 @@ XAI_API_KEY=your-xai-api-key
 HOSTNAME=your-ngrok-domain.ngrok.app
 ```
 
+```bash
+TWILIO_AUTH_TOKEN=your-twilio-auth-token
+```
+
+The auth token (from the [Twilio Console](https://console.twilio.com/)) is used to verify the `X-Twilio-Signature` header on every webhook request, so only Twilio can trigger the TwiML endpoints. Each TwiML response also carries a one-time token that the media-stream WebSocket must present before an XAI session is opened. Requests without a valid signature are rejected with `403`.
+
 ### 5. Run the App
 
 This command will start the Express server which handles incoming Twilio webhook requests and media streams.
@@ -89,9 +95,8 @@ This example also supports making outbound calls where the AI agent initiates th
 Add these to your `.env` file:
 
 ```bash
-# Twilio credentials for outbound calls
+# Twilio credentials for outbound calls (TWILIO_AUTH_TOKEN is already set above)
 TWILIO_ACCOUNT_SID=your-twilio-account-sid
-TWILIO_AUTH_TOKEN=your-twilio-auth-token
 TWILIO_PHONE_NUMBER=+1234567890  # Your Twilio phone number
 
 # The phone number to call

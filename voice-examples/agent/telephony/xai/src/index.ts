@@ -2,8 +2,9 @@ import "dotenv-flow/config";
 import express from "express";
 import ExpressWs from "express-ws";
 import * as crypto from "crypto";
+import twilio from "twilio";
 import bot from "./bot";
-import { TwilioMediaStreamWebsocket } from "./twilio";
+import { TwilioMediaStreamWebsocket, StartEvent } from "./twilio";
 
 const { app } = ExpressWs(express());
 app.use(express.urlencoded({ extended: true })).use(express.json());
@@ -13,8 +14,95 @@ app.use(express.urlencoded({ extended: true })).use(express.json());
 // ========================================
 const XAI_API_KEY = process.env.XAI_API_KEY || "";
 const API_URL = process.env.API_URL || "wss://api.x.ai/v1/realtime";
+// Twilio auth token, used to verify that webhook requests really come from Twilio
+const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
 // Feature flags
 const ENABLE_TOOLS = process.env.ENABLE_TOOLS !== "false"; // Default: enabled
+
+// Public hostname Twilio uses to reach this server (no protocol, no trailing slash)
+function publicHostname(): string {
+  return (process.env.HOSTNAME || "").replace(/^https?:\/\//, "").replace(/\/+$/, "");
+}
+
+// ========================================
+// Twilio Webhook Signature Validation
+// ========================================
+// Twilio signs every webhook request (X-Twilio-Signature: HMAC-SHA1 over the full
+// public URL plus the POST parameters, keyed with the account auth token). Only
+// requests carrying a valid signature reach the TwiML handlers, so an arbitrary party
+// that discovers the public HOSTNAME cannot obtain TwiML or media-stream call tokens.
+function verifyTwilioSignature(req: express.Request, res: express.Response, next: express.NextFunction) {
+  if (!TWILIO_AUTH_TOKEN) {
+    console.error("Rejecting Twilio webhook: TWILIO_AUTH_TOKEN is not set");
+    res.status(503).send("Server misconfigured: TWILIO_AUTH_TOKEN not set");
+    return;
+  }
+  const hostname = publicHostname();
+  if (!hostname) {
+    res.status(500).send("Server misconfigured: HOSTNAME not set");
+    return;
+  }
+  const signature = req.header("X-Twilio-Signature") || "";
+  const url = `https://${hostname}${req.originalUrl}`;
+  const params = req.body && typeof req.body === "object" ? req.body : {};
+  if (!signature || !twilio.validateRequest(TWILIO_AUTH_TOKEN, signature, url, params)) {
+    console.warn(`Rejected webhook request for ${req.path}: missing or invalid X-Twilio-Signature`);
+    res.status(403).send("Forbidden: invalid Twilio signature");
+    return;
+  }
+  next();
+}
+
+// ========================================
+// Per-Call Media Stream Tokens
+// ========================================
+// The signature-validated TwiML endpoints issue a random one-time token that Twilio
+// hands back in the media stream's `start` message (<Parameter name="token" />).
+// The media-stream WebSocket handlers refuse to open an xAI session until they have
+// received a valid, unexpired token, so an unauthenticated WebSocket client cannot
+// drive realtime sessions billed to this server's XAI_API_KEY.
+const CALL_TOKEN_TTL_MS = 5 * 60 * 1000;
+const pendingCallTokens = new Map<string, number>();
+
+function issueCallToken(): string {
+  const now = Date.now();
+  for (const [token, issuedAt] of pendingCallTokens) {
+    if (now - issuedAt > CALL_TOKEN_TTL_MS) {
+      pendingCallTokens.delete(token);
+    }
+  }
+  const token = crypto.randomBytes(16).toString("hex");
+  pendingCallTokens.set(token, now);
+  return token;
+}
+
+function consumeCallToken(token: unknown): boolean {
+  if (typeof token !== "string" || token.length === 0) {
+    return false;
+  }
+  const issuedAt = pendingCallTokens.get(token);
+  if (issuedAt === undefined) {
+    return false;
+  }
+  pendingCallTokens.delete(token);
+  return Date.now() - issuedAt <= CALL_TOKEN_TTL_MS;
+}
+
+// Wait for Twilio's `start` message (which carries the custom parameters) on a
+// freshly connected media stream.
+function waitForStart(tw: TwilioMediaStreamWebsocket, timeoutMs = 10000): Promise<StartEvent> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("Timed out waiting for Twilio start event")), timeoutMs);
+    tw.on("start", (msg) => {
+      clearTimeout(timer);
+      resolve(msg);
+    });
+    tw.ws.once("close", () => {
+      clearTimeout(timer);
+      reject(new Error("Twilio stream closed before start event"));
+    });
+  });
+}
 
 // Clean event logging - just event names, no emojis
 function logEvent(callId: string, eventType: string, extra?: string) {
@@ -86,7 +174,7 @@ app.get("/health", (req, res) => {
 // ========================================
 // Twilio Voice Webhook Endpoints
 // ========================================
-app.post("/twiml", async (req, res) => {
+app.post("/twiml", verifyTwilioSignature, async (req, res) => {
   try {
     const callId = generateSecureId('call');
 
@@ -98,13 +186,16 @@ app.post("/twiml", async (req, res) => {
     res.status(200);
     res.type("text/xml");
 
-    const hostname = process.env.HOSTNAME.replace(/^https?:\/\//, '');
+    const hostname = publicHostname();
     const streamUrl = `wss://${hostname}/media-stream/${callId}`;
+    const token = issueCallToken();
 
     const twimlResponse = `\
 <Response>
   <Connect>
-    <Stream url="${streamUrl}" />
+    <Stream url="${streamUrl}">
+      <Parameter name="token" value="${token}" />
+    </Stream>
   </Connect>
 </Response>
 `;
@@ -114,7 +205,7 @@ app.post("/twiml", async (req, res) => {
   }
 });
 
-app.post("/call-status", async (req, res) => {
+app.post("/call-status", verifyTwilioSignature, async (req, res) => {
   res.status(200).send();
 });
 
@@ -123,16 +214,34 @@ app.post("/call-status", async (req, res) => {
 // ========================================
 app.ws("/media-stream/:callId", async (ws, req) => {
   const callId = req.params.callId;
-  
-  console.log(`\n[${callId}] === CALL STARTED ===`);
+
+  if (typeof callId !== "string" || !/^call_[0-9a-f]{32}$/.test(callId)) {
+    ws.close(1008, "Invalid call id");
+    return;
+  }
 
   const tw = new TwilioMediaStreamWebsocket(ws);
 
-  // Set up Twilio start event handler IMMEDIATELY (before async operations)
-  tw.on("start", (msg) => {
-    tw.streamSid = msg.start.streamSid;
-    logEvent(callId, 'twilio.start');
-  });
+  // Do not contact x.ai until Twilio has proven that this stream belongs to a call
+  // that /twiml issued (see issueCallToken).
+  let startMsg: StartEvent;
+  try {
+    startMsg = await waitForStart(tw);
+  } catch (error: any) {
+    logEvent(callId, 'twilio.start.timeout', error?.message || String(error));
+    ws.close(1008, "Twilio start event not received");
+    return;
+  }
+
+  if (!consumeCallToken(startMsg.start.customParameters?.token)) {
+    logEvent(callId, 'twilio.start.rejected', 'missing or invalid call token');
+    ws.close(1008, "Unauthorized media stream");
+    return;
+  }
+
+  tw.streamSid = startMsg.start.streamSid;
+  logEvent(callId, 'twilio.start');
+  console.log(`\n[${callId}] === CALL STARTED ===`);
 
   // Create raw WebSocket connection to x.ai
   const WebSocket = require('ws');
@@ -143,24 +252,35 @@ app.ws("/media-stream/:callId", async (ws, req) => {
     }
   });
 
-  // Wait for x.ai WebSocket to be ready
-  await new Promise((resolve, reject) => {
-    const wsTimeout = setTimeout(() => {
+  // Wait for x.ai WebSocket to be ready. A failed handshake must not escape as an
+  // unhandled rejection (which would take down the whole server and every live call).
+  try {
+    await new Promise((resolve, reject) => {
+      const wsTimeout = setTimeout(() => {
+        reject(new Error("x.ai WebSocket connection timeout"));
+      }, 10000);
+
+      xaiWs.on('open', () => {
+        clearTimeout(wsTimeout);
+        logEvent(callId, 'websocket.open');
+        resolve(null);
+      });
+
+      xaiWs.on('error', (error: any) => {
+        clearTimeout(wsTimeout);
+        reject(error);
+      });
+    });
+  } catch (error: any) {
+    logEvent(callId, 'websocket.error', error?.message || String(error));
+    try {
       xaiWs.close();
-      reject(new Error("x.ai WebSocket connection timeout"));
-    }, 10000);
-
-    xaiWs.on('open', () => {
-      clearTimeout(wsTimeout);
-      logEvent(callId, 'websocket.open');
-      resolve(null);
-    });
-
-    xaiWs.on('error', (error: any) => {
-      clearTimeout(wsTimeout);
-      reject(error);
-    });
-  });
+    } catch {
+      // Socket already closed
+    }
+    ws.close(1011, "Upstream connection failed");
+    return;
+  }
 
   // Flag to track when session is configured - DO NOT send audio until this is true
   let sessionReady = false;
@@ -377,13 +497,16 @@ Be enthusiastic but not pushy. Answer any questions they have about the technolo
 If they're not interested, politely thank them for their time and end the call gracefully.`;
 
 // TwiML endpoint for outbound calls
-app.post("/outbound-twiml", (req, res) => {
-  const hostname = process.env.HOSTNAME?.replace(/^https?:\/\//, "") || "";
-  
+app.post("/outbound-twiml", verifyTwilioSignature, (req, res) => {
+  const hostname = publicHostname();
+  const token = issueCallToken();
+
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
-    <Stream url="wss://${hostname}/outbound-stream" />
+    <Stream url="wss://${hostname}/outbound-stream">
+      <Parameter name="token" value="${token}" />
+    </Stream>
   </Connect>
 </Response>`;
 
@@ -402,7 +525,13 @@ app.ws("/outbound-stream", (ws: any, req: any) => {
   let turnCount = 0;
   let turnActive = false;
 
-  console.log(`\n[OUTBOUND] === OUTBOUND CALL STARTED ===`);
+  // Drop streams that never present a valid start event (see issueCallToken)
+  const startTimeout = setTimeout(() => {
+    if (!streamSid) {
+      console.log(`[OUTBOUND] Closing media stream: no start event received`);
+      ws.close(1008, "Twilio start event not received");
+    }
+  }, 10000);
 
   // Handle Twilio WebSocket messages
   ws.on("message", async (data: Buffer) => {
@@ -410,8 +539,15 @@ app.ws("/outbound-stream", (ws: any, req: any) => {
       const msg = JSON.parse(data.toString());
 
       if (msg.event === "start") {
+        if (!consumeCallToken(msg.start?.customParameters?.token)) {
+          console.log(`[OUTBOUND] Rejected media stream: missing or invalid call token`);
+          ws.close(1008, "Unauthorized media stream");
+          return;
+        }
+        clearTimeout(startTimeout);
         callSid = msg.start.callSid;
         streamSid = msg.start.streamSid;
+        console.log(`\n[OUTBOUND] === OUTBOUND CALL STARTED ===`);
         console.log(`[OUTBOUND] [${callSid}] twilio.start`);
 
         // Connect to XAI
@@ -419,6 +555,10 @@ app.ws("/outbound-stream", (ws: any, req: any) => {
           headers: {
             Authorization: `Bearer ${XAI_API_KEY}`,
           },
+        });
+
+        xaiWs.on("error", (error: any) => {
+          console.log(`[OUTBOUND] [${callSid}] websocket.error ${error?.message || String(error)}`);
         });
 
         xaiWs.on("open", () => {
@@ -524,6 +664,7 @@ app.ws("/outbound-stream", (ws: any, req: any) => {
   });
 
   ws.on("close", () => {
+    clearTimeout(startTimeout);
     console.log(`[OUTBOUND] twilio.close`);
     if (xaiWs) xaiWs.close();
   });
@@ -536,4 +677,13 @@ const port = process.env.PORT || "3000";
 app.listen(port, () => {
   console.log(`Server running on http://localhost:${port}`);
   console.log(`Tool calling: ${ENABLE_TOOLS ? "ENABLED" : "DISABLED"}`);
+  if (!XAI_API_KEY) {
+    console.warn("WARNING: XAI_API_KEY is not set - realtime sessions will fail");
+  }
+  if (!TWILIO_AUTH_TOKEN) {
+    console.warn("WARNING: TWILIO_AUTH_TOKEN is not set - Twilio webhooks will be rejected");
+  }
+  if (!publicHostname()) {
+    console.warn("WARNING: HOSTNAME is not set - Twilio webhooks will be rejected");
+  }
 });
