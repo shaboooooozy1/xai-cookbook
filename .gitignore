@@ -129,6 +129,8 @@ celerybeat.pid
 
 # Environments
 .env
+.env.local
+.env.*.local
 .venv
 env/
 venv/
@@ -200,6 +202,9 @@ captures/
 .externalNativeBuild/
 .cxx/
 *.log
+
+# Node
+node_modules/
 
 # Misc
 *.DS_Store
