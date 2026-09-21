@@ -13,12 +13,18 @@ import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 # Load environment variables
 load_dotenv()
 
 # Configuration
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or os.getenv("XAI_API_KEY")
+# Bind to loopback by default; set HOST=0.0.0.0 to expose on all interfaces
+HOST = os.getenv("HOST", "127.0.0.1")
 PORT = int(os.getenv("PORT", "8000"))
 SESSION_REQUEST_URL = "https://api.x.ai/v1/realtime/client_secrets"
 
@@ -41,6 +47,11 @@ app = FastAPI(
     description="Ephemeral token provider for XAI realtime voice API (OpenAI-Compatible)",
     version="2.0.0",
 )
+
+# Rate limiting
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # Enable CORS
 app.add_middleware(
@@ -83,6 +94,7 @@ async def health_check():
 
 
 @app.post("/session")
+@limiter.limit("10/minute")
 async def create_session(request: Request):
     """
     Get ephemeral token for direct XAI API connection
@@ -102,11 +114,12 @@ async def create_session(request: Request):
             )
 
         if response.status_code != 200:
+            # Upstream details stay in the server log; callers get a generic error
             print(f"❌ Failed to get ephemeral token: {response.status_code} {response.text}")
-            return {
-                "error": "Failed to create session",
-                "details": response.text,
-            }
+            return JSONResponse(
+                status_code=502,
+                content={"error": "Failed to create session"},
+            )
 
         data = response.json()
         print("✅ Ephemeral session created")
@@ -123,10 +136,10 @@ async def create_session(request: Request):
 
     except Exception as e:
         print(f"❌ Error creating session: {e}")
-        return {
-            "error": "Failed to create session",
-            "details": str(e),
-        }
+        return JSONResponse(
+            status_code=500,
+            content={"error": "Failed to create session"},
+        )
 
 
 # ========================================
@@ -141,6 +154,7 @@ async def startup_event():
     print("🚀 XAI Voice Web Backend (Python)")
     print("   OpenAI SDK Compatible")
     print("=" * 60)
+    print(f"🌐 Host: {HOST}")
     print(f"🌐 Port: {PORT}")
     print(f"🔑 API Key: {'Configured' if OPENAI_API_KEY else '❌ Missing'}")
     print(f"🎙️  Voice: {VOICE}")
@@ -167,7 +181,7 @@ if __name__ == "__main__":
 
     uvicorn.run(
         "main:app",
-        host="0.0.0.0",
+        host=HOST,
         port=PORT,
         log_level="info",
         reload=False,

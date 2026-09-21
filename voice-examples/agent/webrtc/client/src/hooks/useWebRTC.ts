@@ -1,6 +1,6 @@
 /**
  * WebRTC Hook for peer connection and signaling
- * Uses ephemeral tokens for authentication
+ * The server relays audio to XAI; the browser never receives XAI credentials.
  */
 
 import { useState, useCallback, useRef, useEffect } from "react";
@@ -8,19 +8,18 @@ import type { Message } from "../types/messages";
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
 
-interface SessionResponse {
-  client_secret: {
-    value: string;
-    expires_at: number;
-  };
-  voice: string;
-  instructions: string;
-  error?: string;
-}
-
-// Enable TURN servers for restrictive networks (adds 10-15s delay if TURN server is slow/unreachable)
-// Set to false for development/most networks (STUN is sufficient)
-const ENABLE_TURN = true;
+// TURN relay for restrictive networks (adds 10-15s delay if TURN server is slow/unreachable).
+// Opt-in via environment so no third-party relay or shared credentials are used by default:
+//   VITE_ENABLE_TURN=true
+//   VITE_TURN_URLS=turn:turn.example.com:3478,turns:turn.example.com:5349
+//   VITE_TURN_USERNAME=... VITE_TURN_CREDENTIAL=...
+const ENABLE_TURN = import.meta.env.VITE_ENABLE_TURN === "true";
+const TURN_URLS = (import.meta.env.VITE_TURN_URLS || "")
+  .split(",")
+  .map((url: string) => url.trim())
+  .filter((url: string) => url.length > 0);
+const TURN_USERNAME = import.meta.env.VITE_TURN_USERNAME || "";
+const TURN_CREDENTIAL = import.meta.env.VITE_TURN_CREDENTIAL || "";
 
 // Helper to get timestamp with milliseconds for debugging
 const getTimestamp = () => {
@@ -62,6 +61,7 @@ export function useWebRTC(
   const dataChannelRef = useRef<RTCDataChannel | null>(null);
   const signalingWsRef = useRef<WebSocket | null>(null);
   const sessionIdRef = useRef<string | null>(null);
+  const sessionTokenRef = useRef<string | null>(null);
 
   const provider = "WebRTC"; // Always WebRTC for this client
 
@@ -118,17 +118,16 @@ export function useWebRTC(
 
     // Add TURN servers if enabled (only needed for restrictive corporate firewalls)
     if (ENABLE_TURN) {
-      iceServers.push({
-        urls: "turn:openrelay.metered.ca:80",
-        username: "openrelayproject",
-        credential: "openrelayproject",
-      });
-      iceServers.push({
-        urls: "turns:openrelay.metered.ca:443",
-        username: "openrelayproject",
-        credential: "openrelayproject",
-      });
-      console.log("⚠️  TURN servers enabled (may cause slow connection)");
+      if (TURN_URLS.length === 0) {
+        console.warn("⚠️  VITE_ENABLE_TURN is set but VITE_TURN_URLS is empty - TURN disabled");
+      } else {
+        iceServers.push({
+          urls: TURN_URLS,
+          username: TURN_USERNAME,
+          credential: TURN_CREDENTIAL,
+        });
+        console.log("⚠️  TURN servers enabled (may cause slow connection)");
+      }
     }
 
     const pc = new RTCPeerConnection({
@@ -241,24 +240,7 @@ export function useWebRTC(
       setIsConnecting(true);
       setIsConnected(false);
 
-      // 1. Get ephemeral token first
-      console.log(`[${getTimestamp()}] 📝 Getting ephemeral token...`);
-      const tokenResponse = await fetch(`${API_BASE_URL}/session`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-      });
-
-      if (!tokenResponse.ok) {
-        throw new Error(`Failed to get ephemeral token: ${tokenResponse.statusText}`);
-      }
-
-      const tokenData: SessionResponse = await tokenResponse.json();
-      if (tokenData.error) {
-        throw new Error(tokenData.error);
-      }
-      console.log(`[${getTimestamp()}] ✅ Ephemeral token received`);
-
-      // 2. Create session with sample rate
+      // 1. Create session with sample rate
       console.log(`[${getTimestamp()}] 📝 Creating WebRTC session with sample rate: ${sampleRate}Hz`);
       const response = await fetch(`${API_BASE_URL}/sessions`, {
         method: "POST",
@@ -274,6 +256,7 @@ export function useWebRTC(
 
       const data = await response.json();
       sessionIdRef.current = data.session_id;
+      sessionTokenRef.current = data.session_token ?? null;
       console.log(`[${getTimestamp()}] ✅ Session created: ${data.session_id} with ${data.sample_rate}Hz`);
 
       // 2. Set up peer connection
@@ -382,12 +365,18 @@ export function useWebRTC(
       signalingWsRef.current = null;
     }
 
-    // Delete session
+    // Delete session (authorized with the token returned at creation)
     if (sessionIdRef.current) {
+      const headers: Record<string, string> = {};
+      if (sessionTokenRef.current) {
+        headers["Authorization"] = `Bearer ${sessionTokenRef.current}`;
+      }
       fetch(`${API_BASE_URL}/sessions/${sessionIdRef.current}`, {
         method: "DELETE",
+        headers,
       }).catch(console.error);
       sessionIdRef.current = null;
+      sessionTokenRef.current = null;
     }
 
     setIsConnected(false);

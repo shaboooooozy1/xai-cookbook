@@ -8,6 +8,8 @@ import type WebSocket from "ws";
 // Session state
 export interface Session {
   id: string;
+  // Secret returned only to the creator; required to delete or inspect the session
+  token: string;
   created_at: string;
   status: "created" | "active" | "closed";
   sample_rate: number;
