@@ -108,7 +108,7 @@ Service information
   "status": "running",
   "endpoints": {
     "health": "/health",
-    "sessions": "/sessions",
+    "sessions": "POST /sessions",
     "signaling": "/signaling/{session_id}"
   }
 }
@@ -136,47 +136,22 @@ Health check and server status
 ```
 
 #### `POST /sessions`
-Create a new session
+Create a new session (rate limited to 10 requests per minute per IP)
 
 **Response**:
 ```json
 {
   "session_id": "session_1699632000000_abc123",
+  "session_token": "0123456789abcdef0123456789abcdef",
   "signaling_url": "/signaling/session_1699632000000_abc123",
   "created_at": "2025-11-10T12:00:00.000Z"
 }
 ```
 
-#### `GET /sessions`
-List all active sessions
-
-**Response**:
-```json
-{
-  "sessions": [
-    {
-      "id": "session_1699632000000_abc123",
-      "created_at": "2025-11-10T12:00:00.000Z",
-      "status": "active",
-      "webrtc_stats": {
-        "bitrate": {
-          "audio_in": 0,
-          "audio_out": 0
-        },
-        "jitter": 0,
-        "packetLoss": 0,
-        "connectionState": "connected",
-        "iceConnectionState": "connected",
-        "lastUpdated": "2025-11-10T12:00:05.000Z"
-      }
-    }
-  ],
-  "count": 1
-}
-```
+The `session_token` is returned only to the creator of the session and must be sent as `Authorization: Bearer <session_token>` on the per-session endpoints below. There is no endpoint that lists sessions.
 
 #### `DELETE /sessions/:sessionId`
-Delete a session
+Delete a session (requires the session token)
 
 **Response**:
 ```json
@@ -187,7 +162,7 @@ Delete a session
 ```
 
 #### `GET /sessions/:sessionId/stats`
-Get WebRTC statistics for a session
+Get WebRTC statistics for a session (requires the session token)
 
 **Response**:
 ```json

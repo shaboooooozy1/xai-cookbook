@@ -109,12 +109,13 @@ VITE_API_BASE_URL=http://localhost:8001
 
 ### TURN Server Configuration
 
-The client includes an `ENABLE_TURN` flag to optionally enable TURN servers for restrictive network environments.
+TURN relay is disabled by default (STUN only) and is opted into through environment variables read by `src/hooks/useWebRTC.ts`, so no third-party relay or shared credentials are used unless you provide your own:
 
-**Location**: `src/hooks/useWebRTC.ts` (line 13)
-
-```typescript
-const ENABLE_TURN = false;  // Default: false (STUN only)
+```bash
+VITE_ENABLE_TURN=true
+VITE_TURN_URLS=turn:turn.example.com:3478,turns:turn.example.com:5349
+VITE_TURN_USERNAME=your-turn-username
+VITE_TURN_CREDENTIAL=your-turn-credential
 ```
 
 **When to enable**:

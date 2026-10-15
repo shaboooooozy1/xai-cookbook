@@ -8,6 +8,7 @@
 import "dotenv/config";
 import express from "express";
 import ExpressWs from "express-ws";
+import rateLimit from "express-rate-limit";
 import type WebSocket from "ws";
 import { SessionManager } from "./session-manager";
 import { RTCPeerManager } from "./rtc-peer";
@@ -37,18 +38,50 @@ app.use((req, res, next) => {
   if (origin && ALLOWED_ORIGINS.includes(origin)) {
     res.header("Access-Control-Allow-Origin", origin);
   }
+  // The ACAO value depends on the request's Origin, so shared caches must key on it
+  res.header("Vary", "Origin");
   res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
   res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
   res.header("Access-Control-Allow-Credentials", "true");
-  
+
   if (req.method === "OPTIONS") {
     return res.sendStatus(200);
   }
-  
+
   next();
 });
 
 app.use(express.json());
+
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100,
+  message: 'Too many requests from this IP, please try again later.'
+});
+
+const sessionLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 10,
+  message: 'Too many session creation requests, please try again later.'
+});
+
+app.use(limiter);
+
+// Session token check for per-session routes: the token is returned only by
+// POST /sessions, so only the creator of a session can delete or inspect it.
+function requireSessionToken(req: express.Request, res: express.Response, next: express.NextFunction) {
+  const { sessionId } = req.params;
+  if (!sessionManager.getSession(sessionId)) {
+    return res.status(404).json({ error: "Session not found" });
+  }
+  const authHeader = req.header("Authorization") || "";
+  const token = authHeader.startsWith("Bearer ") ? authHeader.slice("Bearer ".length).trim() : undefined;
+  if (!sessionManager.verifySessionToken(sessionId, token)) {
+    return res.status(403).json({ error: "Invalid session token" });
+  }
+  next();
+}
 
 // Configuration
 const XAI_API_KEY = process.env.XAI_API_KEY || "";
@@ -76,7 +109,7 @@ app.get("/", (req, res) => {
     status: "running",
     endpoints: {
       health: "/health",
-      sessions: "/sessions",
+      sessions: "POST /sessions",
       signaling: "/signaling/{session_id}",
     },
   });
@@ -97,7 +130,7 @@ app.get("/health", (req, res) => {
  * Get ephemeral token for direct XAI API connection
  * POST /session
  */
-app.post("/session", async (req, res) => {
+app.post("/session", sessionLimiter, async (req, res) => {
   try {
     console.log("📝 Creating ephemeral session...");
 
@@ -115,11 +148,9 @@ app.post("/session", async (req, res) => {
 
     if (!response.ok) {
       const errorText = await response.text();
+      // Upstream details stay in the server log; callers get a generic error
       console.error(`❌ Failed to get ephemeral token: ${response.status} ${errorText}`);
-      return res.status(response.status).json({ 
-        error: "Failed to create session",
-        details: errorText 
-      });
+      return res.status(502).json({ error: "Failed to create session" });
     }
 
     const data = await response.json() as Record<string, unknown>;
@@ -133,14 +164,11 @@ app.post("/session", async (req, res) => {
     });
   } catch (error) {
     console.error("❌ Error creating session:", error);
-    res.status(500).json({ 
-      error: "Failed to create session",
-      details: error instanceof Error ? error.message : "Unknown error"
-    });
+    res.status(500).json({ error: "Failed to create session" });
   }
 });
 
-app.post("/sessions", (req, res) => {
+app.post("/sessions", sessionLimiter, (req, res) => {
   // Get sample rate from request body
   const requestedSampleRate = req.body.sample_rate || 24000;
   
@@ -160,32 +188,15 @@ app.post("/sessions", (req, res) => {
   const session = sessionManager.createSession(sampleRate);
   res.json({
     session_id: session.id,
+    session_token: session.token,
     signaling_url: `/signaling/${session.id}`,
     created_at: session.created_at,
     sample_rate: session.sample_rate,
   });
 });
 
-app.get("/sessions", (req, res) => {
-  const sessions = sessionManager.getAllSessions();
-  res.json({
-    sessions: sessions.map((s) => ({
-      id: s.id,
-      created_at: s.created_at,
-      status: s.status,
-      webrtc_stats: s.webrtcStats,
-    })),
-    count: sessions.length,
-  });
-});
-
-app.delete("/sessions/:sessionId", (req, res) => {
+app.delete("/sessions/:sessionId", requireSessionToken, (req, res) => {
   const { sessionId } = req.params;
-  const session = sessionManager.getSession(sessionId);
-  
-  if (!session) {
-    return res.status(404).json({ error: "Session not found" });
-  }
 
   // Clean up peer connection
   const peer = peerConnections.get(sessionId);
@@ -202,13 +213,8 @@ app.delete("/sessions/:sessionId", (req, res) => {
   });
 });
 
-app.get("/sessions/:sessionId/stats", async (req, res) => {
+app.get("/sessions/:sessionId/stats", requireSessionToken, async (req, res) => {
   const { sessionId } = req.params;
-  const session = sessionManager.getSession(sessionId);
-  
-  if (!session) {
-    return res.status(404).json({ error: "Session not found" });
-  }
 
   const peer = peerConnections.get(sessionId);
   if (!peer) {
@@ -231,6 +237,14 @@ app.get("/sessions/:sessionId/stats", async (req, res) => {
 app.ws("/signaling/:sessionId", async (ws: WebSocket, req) => {
   const sessionId = req.params.sessionId;
   console.log(`[${sessionId}] 🔌 Client connected for signaling`);
+
+  // WebSocket upgrades are not covered by CORS, so enforce the origin allowlist here
+  const origin = req.headers.origin;
+  if (!origin || !ALLOWED_ORIGINS.includes(origin)) {
+    ws.close(1008, "Origin not allowed");
+    console.log(`[${sessionId}] ❌ Origin ${origin || "(none)"} not allowed - signaling connection rejected`);
+    return;
+  }
 
   // Verify session exists (must be created via POST /sessions first)
   const session = sessionManager.getSession(sessionId);

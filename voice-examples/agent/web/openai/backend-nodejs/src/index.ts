@@ -20,6 +20,8 @@ app.use((req, res, next) => {
   if (origin && ALLOWED_ORIGINS.includes(origin)) {
     res.header("Access-Control-Allow-Origin", origin);
   }
+  // The ACAO value depends on the request's Origin, so shared caches must key on it
+  res.header("Vary", "Origin");
   res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
   res.header("Access-Control-Allow-Credentials", "true");
@@ -98,11 +100,9 @@ app.post("/session", sessionLimiter, async (req, res) => {
 
     if (!response.ok) {
       const errorText = await response.text();
+      // Upstream details stay in the server log; callers get a generic error
       console.error(`❌ Failed to get ephemeral token: ${response.status} ${errorText}`);
-      return res.status(response.status).json({ 
-        error: "Failed to create session",
-        details: errorText 
-      });
+      return res.status(502).json({ error: "Failed to create session" });
     }
 
     const data = await response.json() as { value: string; expires_at: number };
@@ -119,10 +119,7 @@ app.post("/session", sessionLimiter, async (req, res) => {
     });
   } catch (error) {
     console.error("❌ Error creating session:", error);
-    res.status(500).json({ 
-      error: "Failed to create session",
-      details: error instanceof Error ? error.message : "Unknown error"
-    });
+    res.status(500).json({ error: "Failed to create session" });
   }
 });
 

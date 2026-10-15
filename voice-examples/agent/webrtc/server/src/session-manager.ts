@@ -22,6 +22,7 @@ export class SessionManager {
     const sessionId = this.generateSessionId();
     const session: Session = {
       id: sessionId,
+      token: crypto.randomBytes(16).toString('hex'),
       created_at: new Date().toISOString(),
       status: "created",
       sample_rate: sampleRate,
@@ -36,6 +37,19 @@ export class SessionManager {
    */
   getSession(sessionId: string): Session | undefined {
     return this.sessions.get(sessionId);
+  }
+
+  /**
+   * Check that a token matches the session's token (constant-time comparison)
+   */
+  verifySessionToken(sessionId: string, token: string | undefined): boolean {
+    const session = this.sessions.get(sessionId);
+    if (!session || typeof token !== "string") {
+      return false;
+    }
+    const expected = Buffer.from(session.token);
+    const provided = Buffer.from(token);
+    return expected.length === provided.length && crypto.timingSafeEqual(expected, provided);
   }
 
   /**

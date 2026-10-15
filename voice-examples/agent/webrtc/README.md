@@ -137,13 +137,13 @@ The client automatically connects to `http://localhost:8000` (or `VITE_API_BASE_
 
 ### TURN Server Configuration
 
-Both client and server include an `ENABLE_TURN` flag to optionally enable TURN servers for restrictive network environments:
+Both client and server can optionally use TURN servers for restrictive network environments:
 
 **Location**: 
-- Client: `client/src/hooks/useWebRTC.ts` (line 13)
-- Server: `server/src/rtc-peer.ts` (line 9)
+- Client: environment variables read by `client/src/hooks/useWebRTC.ts` (`VITE_ENABLE_TURN=true`, `VITE_TURN_URLS`, `VITE_TURN_USERNAME`, `VITE_TURN_CREDENTIAL`)
+- Server: `ENABLE_TURN` flag in `server/src/rtc-peer.ts`
 
-**Default**: `false` (STUN only, recommended for most networks)
+**Default**: disabled (STUN only, recommended for most networks). No third-party relay or shared credentials are used unless you configure your own.
 
 **When to enable**:
 - Restrictive corporate firewalls that block UDP
